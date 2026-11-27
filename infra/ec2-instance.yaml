@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Mobile Repair Shop - EC2 Hosting Infrastructure (CloudFormation + SSM KeyPair + Security Group)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type (t2.micro is free-tier eligible)
+
+  UbuntuAMI:
+    Type: String
+    Default: ami-0e86e20dae9224db8
+    Description: Ubuntu 24.04 LTS AMI in us-east-1
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Allow SSH from anywhere (required for GitHub Actions runners)
+
+Resources:
+  # 1. SSH KeyPair - private key auto-saved to SSM Parameter Store
+  ServerKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-key"
+
+  # 2. Security Group - opens Port 80 (HTTP) and Port 22 (SSH)
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH access to the Mobile Repair Shop server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  # 3. Ubuntu EC2 Virtual Machine with bootstrap script (UserData)
+  ServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ServerKeyPair
+      SecurityGroupIds:
+        - !GetAtt ServerSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-server"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > /var/log/userdata.log 2>&1
+
+          # Update system and install Node.js 22, Git, Nginx, PM2
+          apt-get update -y
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs nginx git
+
+          npm install -g pm2
+
+          # Clone the repository
+          mkdir -p /var/www/app
+          git clone https://github.com/sabitrapachhai-ux/Deployment.git /var/www/app
+
+          # Apply Nginx configuration
+          cp /var/www/app/infra/nginx.conf /etc/nginx/sites-available/app
+          ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
+          rm -f /etc/nginx/sites-enabled/default
+
+          nginx -t
+          systemctl enable nginx
+          systemctl restart nginx
+
+          # Set correct ownership
+          chown -R ubuntu:ubuntu /var/www/app
+
+          # Configure PM2 to auto-start on reboot
+          sudo -u ubuntu pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash
+
+Outputs:
+  PublicIP:
+    Description: Public IP address of the EC2 server
+    Value: !GetAtt ServerInstance.PublicIp
+
+  PublicURL:
+    Description: Live website URL
+    Value: !Sub "http://${ServerInstance.PublicIp}"
+
+  SSMKeyPath:
+    Description: SSM Parameter Store path for the private SSH key
+    Value: !Sub "/ec2/keypair/${ServerKeyPair.KeyPairId}"
